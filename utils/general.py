@@ -881,31 +881,45 @@ def clip_segments(segments, shape):
 
 
 # IOU-NMS
-def NMS(boxes, scores, iou_thres, GIoU=False, DIoU=False, CIoU=False, EIOU=False):
+def NMS(boxes, scores, iou_thres, DIoU=False):
+    """
+        boxes:左上角点，右下角点的坐标 (x1, y1, x2, y2)，shape(n,4)---->(1009,4)
+        scores:每个anchor的置信度分数,shape(n)---->(1009)
+        iou_thres: IOU阈值
+        return:keep (Tensor): int64 tensor with the indices
+                of the elements that have been kept
+                by NMS, sorted in decreasing order of scores
+        """
+    # 按confidence得分从大到小排序，B:拿到索引值,shape(n),data(range(n))
     B = torch.argsort(scores, dim=-1, descending=True)
     keep = []
     while B.numel() > 0:
-        index = B[0]
-        keep.append(index)
+        # 取出置信度最高的
+        i = B[0]
+        keep.append(i)
         if B.numel() == 1:
             break
-        iou = bbox_iou(boxes[index, :], boxes[B[1:], :], xywh=False, GIoU=GIoU, DIoU=DIoU, CIoU=CIoU, EIOU=EIOU)
+        # 计算iou,iou.shape(n-1,1)，boxes.shape(index,4)
+        iou = bbox_iou(boxes[i, :].reshape(-1, 4), boxes[B[1:], :].reshape(-1, 4), xywh=False, DIoU=DIoU).reshape(-1)
+        '''找到符合阈值的索引：torch.nonzero：非零元素定位:返回非零的准确位置，每个列向量表示其维度上位置的坐标点，
+           bool.shape(n-1,1)---nonzero--->2*（index,0).reshape---->(2*(n-1)),data(index1,0,index2,0,......)'''
         inds = torch.nonzero(torch.Tensor(iou <= iou_thres)).reshape(-1)
+        # (index+1,1)还原到B的尺度上，相当于除去了第一项以及大于iou值的部分
         B = B[inds + 1]
-    return torch.tensor(keep)
+    return torch.tensor(keep, device=boxes.device)
 
 
 
 
 def non_max_suppression(
-        prediction,
+        prediction,         # (1,na,nc+5)
         conf_thres=0.25,
         iou_thres=0.45,
-        classes=None,
-        agnostic=False,
-        multi_label=False,
+        classes=None,           # Filter by class
+        agnostic=False,         # True：表示多个类一起计算nms ；False：表示按照不同的类分别进行计算nms
+        multi_label=False,      # 一个框是否可以预测两个类别
         labels=(),
-        max_det=300,
+        max_det=300,            # 每张图预测框的最大数量
         nm=0,  # number of masks
 ):
     """Non-Maximum Suppression (NMS) on inference results to reject overlapping detections
@@ -926,21 +940,21 @@ def non_max_suppression(
         prediction = prediction.cpu()
     bs = prediction.shape[0]  # batch size
     nc = prediction.shape[2] - nm - 5  # number of classes
-    xc = prediction[..., 4] > conf_thres  # candidates
+    xc = prediction[..., 4] > conf_thres  # 用confidence阈值初步过滤掉部分框，布尔值，（1,na）
 
     # Settings
     # min_wh = 2  # (pixels) minimum box width and height
-    max_wh = 7680  # (pixels) maximum box width and height
-    max_nms = 30000  # maximum number of boxes into torchvision.ops.nms()
-    time_limit = 0.5 + 0.05 * bs  # seconds to quit after
-    redundant = True  # require redundant detections
+    max_wh = 7680  # （像素）最大框宽度和高度
+    max_nms = 1000  # 送入torchvision.ops.nms()的最大anchor个数
+    time_limit = 0.5 + 0.05 * bs  # nms的最大进行时间
+    redundant = True  #
     multi_label &= nc > 1  # multiple labels per box (adds 0.5ms/img)
     merge = False  # use merge-NMS
 
     t = time.time()
     mi = 5 + nc  # mask start index
     output = [torch.zeros((0, 6 + nm), device=prediction.device)] * bs
-    for xi, x in enumerate(prediction):  # image index, image inference
+    for xi, x in enumerate(prediction):  # image index, image inference     x.shape=(na,nc+5)
         # Apply constraints
         # x[((x[..., 2:4] < min_wh) | (x[..., 2:4] > max_wh)).any(1), 4] = 0  # width-height
         x = x[xc[xi]]  # confidence
@@ -954,11 +968,11 @@ def non_max_suppression(
             v[range(len(lb)), lb[:, 0].long() + 5] = 1.0  # cls
             x = torch.cat((x, v), 0)
 
-        # If none remain process next image
+        # 如果没有则处理下一个图像
         if not x.shape[0]:
             continue
 
-        # Compute conf
+        # 计算阈值：
         x[:, 5:] *= x[:, 4:5]  # conf = obj_conf * cls_conf
 
         # Box/Mask
@@ -966,6 +980,7 @@ def non_max_suppression(
         mask = x[:, mi:]  # zero columns if no masks
 
         # Detections matrix nx6 (xyxy, conf, cls)
+        # nonzero:找出n个m维tensor中的非零元素，返回的结果为m*n
         if multi_label:
             i, j = (x[:, 5:mi] > conf_thres).nonzero(as_tuple=False).T
             x = torch.cat((box[i], x[i, 5 + j, None], j[:, None].float(), mask[i]), 1)
@@ -985,13 +1000,14 @@ def non_max_suppression(
         n = x.shape[0]  # number of boxes
         if not n:  # no boxes
             continue
-        x = x[x[:, 4].argsort(descending=True)[:max_nms]]  # sort by confidence and remove excess boxes
+        # argsort：返回对指定维度重排序后新位子上之前位置的索引
+        x = x[x[:, 4].argsort(descending=True)[:max_nms]]  # 按置信度降序排序，并删除多余的框
 
         # Batched NMS
         c = x[:, 5:6] * (0 if agnostic else max_wh)  # classes
         boxes, scores = x[:, :4] + c, x[:, 4]  # boxes (offset by class), scores
-#         i = torchvision.ops.nms(boxes, scores, iou_thres)  # NMS
-        i = NMS(boxes, scores, iou_thres, EIOU=True)
+        # i = torchvision.ops.nms(boxes, scores, iou_thres)  # NMS
+        i = NMS(boxes, scores, iou_thres, DIoU=True)
         i = i[:max_det]  # limit detections
         if merge and (1 < n < 3E3):  # Merge NMS (boxes merged using weighted mean)
             # update boxes as boxes(i,4) = weights(i,n) * boxes(n,4)
